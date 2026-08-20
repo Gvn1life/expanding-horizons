@@ -10,6 +10,7 @@ export const HEADER_ROW = [
   "NPI(s)",
   "First Found",
   "Last Seen",
+  "Website",
 ];
 
 export type LeadRow = {
@@ -19,6 +20,7 @@ export type LeadRow = {
   phone: string;
   distanceMiles: number;
   npis: string[];
+  website: string;
 };
 
 export function normalizeAddressKey(address: string): string {
@@ -72,13 +74,19 @@ async function ensureHeader(): Promise<void> {
 
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${SHEET_TAB}!A1:H1`,
+    range: `${SHEET_TAB}!A1:I1`,
   });
 
-  if (!existing.data.values || existing.data.values.length === 0) {
+  const currentHeader = existing.data.values?.[0] ?? [];
+  // Covers both a brand-new sheet (no header yet) and upgrading an older sheet that
+  // predates a column being added (e.g. "Website") — existing data rows are untouched
+  // since only row 1 is written here.
+  const needsWrite = HEADER_ROW.some((col, i) => currentHeader[i] !== col);
+
+  if (needsWrite) {
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${SHEET_TAB}!A1:H1`,
+      range: `${SHEET_TAB}!A1:I1`,
       valueInputOption: "RAW",
       requestBody: { values: [HEADER_ROW] },
     });
@@ -156,6 +164,7 @@ export async function syncLeadsToSheet(
         lead.npis.join(", "),
         today,
         today,
+        lead.website,
       ]);
     }
   }

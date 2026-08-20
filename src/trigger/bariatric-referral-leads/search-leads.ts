@@ -3,6 +3,7 @@ import { sweepAllTownsAndSpecialties, SEED, type Candidate } from "./npi-search.
 import { batchGeocodeAddresses, geocodeAddress, haversineMiles, sleep, type LatLon } from "./geocode.js";
 import { syncLeadsToSheet, getKnownLeadKeys, normalizeAddressKey, type LeadRow } from "./sheets.js";
 import { confirmLegitimateLeads, type CandidateGroupPayload } from "./confirm-legitimate-leads.js";
+import { findWebsite } from "./website-lookup.js";
 
 // Agent 1: search. Sweeps the NPI Registry, groups results into candidate practice
 // addresses, hands them to the confirm agent (agent 2, confirm-legitimate-leads.ts) to
@@ -11,6 +12,7 @@ import { confirmLegitimateLeads, type CandidateGroupPayload } from "./confirm-le
 
 const RADIUS_MILES = 15;
 const NOMINATIM_DELAY_MS = 1100; // stay under Nominatim's 1 req/sec usage-policy limit
+const MAX_NEW_LEADS_PER_RUN = 25; // also keeps website lookups well under the free-tier quota
 
 type Group = {
   key: string;
@@ -154,7 +156,8 @@ export const searchBariatricReferralLeads = schedules.task({
 
     const locations = await geocodeGroups(confirmedGroups);
 
-    const leads: LeadRow[] = [];
+    type ScoredGroup = { group: CandidateGroupPayload; distanceMiles: number };
+    const inRadius: ScoredGroup[] = [];
     for (const group of confirmedGroups) {
       const location = locations.get(group.key);
       if (!location) continue;
@@ -162,6 +165,18 @@ export const searchBariatricReferralLeads = schedules.task({
       const distanceMiles = haversineMiles(SEED, location);
       if (distanceMiles > RADIUS_MILES) continue;
 
+      inRadius.push({ group, distanceMiles });
+    }
+    inRadius.sort((a, b) => a.distanceMiles - b.distanceMiles);
+    console.log(`${inRadius.length} confirmed practices within ${RADIUS_MILES} miles`);
+
+    // Cap here (not just in syncLeadsToSheet) so website lookups only run for leads that
+    // will actually be written — keeps us well under the search API's free-tier quota.
+    const toAdd = inRadius.slice(0, MAX_NEW_LEADS_PER_RUN);
+
+    const leads: LeadRow[] = [];
+    for (const { group, distanceMiles } of toAdd) {
+      const website = await findWebsite(`${[...group.names][0]} ${group.city} MA`);
       leads.push({
         name: group.names.join(" / "),
         specialty: group.specialties.join(", "),
@@ -169,13 +184,12 @@ export const searchBariatricReferralLeads = schedules.task({
         phone: group.phone,
         distanceMiles,
         npis: group.npis,
+        website,
       });
     }
-    leads.sort((a, b) => a.distanceMiles - b.distanceMiles);
-    console.log(`${leads.length} confirmed practices within ${RADIUS_MILES} miles`);
 
-    // Already-known groups just need their "Last Seen" date touched — distance and
-    // legitimacy were already established when they were first added.
+    // Already-known groups just need their "Last Seen" date touched — distance, legitimacy,
+    // and website were already established when they were first added.
     const refreshLeads: LeadRow[] = knownGroups.map((group) => ({
       name: [...group.names].join(" / "),
       specialty: [...group.specialties].join(", "),
@@ -183,11 +197,12 @@ export const searchBariatricReferralLeads = schedules.task({
       phone: group.phone,
       distanceMiles: 0,
       npis: [...group.npis],
+      website: "",
     }));
 
-    const { added, updated } = await syncLeadsToSheet([...leads, ...refreshLeads]);
+    const { added, updated } = await syncLeadsToSheet([...leads, ...refreshLeads], MAX_NEW_LEADS_PER_RUN);
     console.log(`Sheet sync: ${added} new leads added, ${updated} existing leads refreshed`);
 
-    return { confirmedWithinRadius: leads.length, added, updated };
+    return { confirmedWithinRadius: inRadius.length, added, updated };
   },
 });
