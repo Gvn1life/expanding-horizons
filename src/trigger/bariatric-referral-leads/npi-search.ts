@@ -65,6 +65,8 @@ type NpiResult = {
 export type Candidate = {
   npi: string;
   name: string;
+  isOrganization: boolean;
+  organizationName: string; // this candidate's org name if it IS an organization (NPI-2), else ""
   specialtyLabel: string;
   primaryTaxonomy: string;
   addressLine: string;
@@ -125,6 +127,7 @@ export async function sweepAllTownsAndSpecialties(): Promise<Candidate[]> {
         const name = providerName(result.basic);
         if (!name) continue;
 
+        const isOrganization = result.enumeration_type === "NPI-2";
         const primaryTaxonomy =
           result.taxonomies.find((t) => t.primary)?.desc ?? specialty.taxonomyQuery;
 
@@ -132,6 +135,8 @@ export async function sweepAllTownsAndSpecialties(): Promise<Candidate[]> {
           candidates.push({
             npi: result.number,
             name,
+            isOrganization,
+            organizationName: isOrganization ? name : "",
             specialtyLabel: specialty.label,
             primaryTaxonomy,
             addressLine: `${addr.address_1}${addr.address_2 ? " " + addr.address_2 : ""}`,

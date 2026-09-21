@@ -4,3 +4,5 @@ node_modules/
 .trigger/
 dist/
 *.log
+desktop.ini
+Thumbs.db

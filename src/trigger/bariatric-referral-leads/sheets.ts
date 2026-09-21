@@ -11,10 +11,12 @@ export const HEADER_ROW = [
   "First Found",
   "Last Seen",
   "Website",
+  "Practice Name",
 ];
 
 export type LeadRow = {
   name: string;
+  practiceName: string;
   specialty: string;
   address: string;
   phone: string;
@@ -74,19 +76,20 @@ async function ensureHeader(): Promise<void> {
 
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${SHEET_TAB}!A1:I1`,
+    range: `${SHEET_TAB}!A1:J1`,
   });
 
   const currentHeader = existing.data.values?.[0] ?? [];
   // Covers both a brand-new sheet (no header yet) and upgrading an older sheet that
-  // predates a column being added (e.g. "Website") — existing data rows are untouched
-  // since only row 1 is written here.
+  // predates a column being added (e.g. "Website", "Practice Name") — existing data rows
+  // are untouched since only row 1 is written here, and new columns are always appended
+  // at the end so previously-written rows never shift out from under their headers.
   const needsWrite = HEADER_ROW.some((col, i) => currentHeader[i] !== col);
 
   if (needsWrite) {
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${SHEET_TAB}!A1:I1`,
+      range: `${SHEET_TAB}!A1:J1`,
       valueInputOption: "RAW",
       requestBody: { values: [HEADER_ROW] },
     });
@@ -122,6 +125,36 @@ export async function getKnownLeadKeys(): Promise<Set<string>> {
   await ensureHeader();
   const existing = await readExistingAddressRows();
   return new Set(existing.keys());
+}
+
+/**
+ * NPIs already present anywhere in the sheet, across every existing row's "NPI(s)" column.
+ * Many providers hold privileges at multiple practices, so the same NPI can legitimately
+ * turn up at more than one address in a fresh sweep — this lets callers keep a provider
+ * listed only once (at wherever they were first logged) instead of adding them again under
+ * a different address in a later week.
+ */
+export async function getKnownProviderNpis(): Promise<Set<string>> {
+  await ensureSheetTabExists();
+  await ensureHeader();
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSheetId();
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${SHEET_TAB}!F2:F`,
+  });
+
+  const npis = new Set<string>();
+  for (const row of result.data.values ?? []) {
+    const cell = row[0];
+    if (!cell) continue;
+    for (const npi of cell.split(",")) {
+      const trimmed = npi.trim();
+      if (trimmed) npis.add(trimmed);
+    }
+  }
+  return npis;
 }
 
 /**
@@ -165,6 +198,7 @@ export async function syncLeadsToSheet(
         today,
         today,
         lead.website,
+        lead.practiceName,
       ]);
     }
   }

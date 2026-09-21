@@ -1,8 +1,12 @@
 import { schedules } from "@trigger.dev/sdk";
 import { sweepAllTownsAndSpecialties, SEED, type Candidate } from "./npi-search.js";
 import { batchGeocodeAddresses, geocodeAddress, haversineMiles, sleep, type LatLon } from "./geocode.js";
-import { syncLeadsToSheet, getKnownLeadKeys, normalizeAddressKey, type LeadRow } from "./sheets.js";
-import { confirmLegitimateLeads, type CandidateGroupPayload } from "./confirm-legitimate-leads.js";
+import { syncLeadsToSheet, getKnownLeadKeys, getKnownProviderNpis, normalizeAddressKey, type LeadRow } from "./sheets.js";
+import {
+  confirmLegitimateLeads,
+  type CandidateGroupPayload,
+  type ProviderPayload,
+} from "./confirm-legitimate-leads.js";
 import { findWebsite } from "./website-lookup.js";
 
 // Agent 1: search. Sweeps the NPI Registry, groups results into candidate practice
@@ -14,20 +18,18 @@ const RADIUS_MILES = 15;
 const NOMINATIM_DELAY_MS = 1100; // stay under Nominatim's 1 req/sec usage-policy limit
 const MAX_NEW_LEADS_PER_RUN = 25; // also keeps website lookups well under the free-tier quota
 
-type Group = {
+export type Group = {
   key: string;
   street: string;
   city: string;
   zip: string;
   fullAddress: string;
-  names: Set<string>;
-  specialties: Set<string>;
-  npis: Set<string>;
-  npiStatuses: Set<string>;
+  practiceName: string; // org/practice name at this address, from an NPI-2 record if one was found
+  providers: Map<string, ProviderPayload>; // keyed by NPI
   phone: string;
 };
 
-function groupByAddress(candidates: Candidate[]): Map<string, Group> {
+export function groupByAddress(candidates: Candidate[]): Map<string, Group> {
   const groups = new Map<string, Group>();
 
   for (const candidate of candidates) {
@@ -43,36 +45,42 @@ function groupByAddress(candidates: Candidate[]): Map<string, Group> {
         city: candidate.city,
         zip,
         fullAddress,
-        names: new Set(),
-        specialties: new Set(),
-        npis: new Set(),
-        npiStatuses: new Set(),
+        practiceName: "",
+        providers: new Map(),
         phone: "",
       };
       groups.set(key, group);
     }
 
-    group.names.add(candidate.name);
-    group.specialties.add(candidate.specialtyLabel);
-    group.npis.add(candidate.npi);
-    group.npiStatuses.add(candidate.npiStatus);
+    // Organization (NPI-2) records identify the practice itself, not an individual
+    // provider — use it to name the practice rather than listing it as a "provider".
+    if (candidate.isOrganization) {
+      if (!group.practiceName) group.practiceName = candidate.organizationName;
+    } else if (!group.providers.has(candidate.npi)) {
+      group.providers.set(candidate.npi, {
+        npi: candidate.npi,
+        name: candidate.name,
+        specialtyLabel: candidate.specialtyLabel,
+        primaryTaxonomy: candidate.primaryTaxonomy,
+        npiStatus: candidate.npiStatus,
+      });
+    }
+
     if (!group.phone && candidate.phone) group.phone = candidate.phone;
   }
 
   return groups;
 }
 
-function toPayload(group: Group): CandidateGroupPayload {
+export function toPayload(group: Group): CandidateGroupPayload {
   return {
     key: group.key,
     street: group.street,
     city: group.city,
     zip: group.zip,
     fullAddress: group.fullAddress,
-    names: [...group.names],
-    specialties: [...group.specialties],
-    npis: [...group.npis],
-    npiStatuses: [...group.npiStatuses],
+    practiceName: group.practiceName,
+    providers: [...group.providers.values()],
     phone: group.phone,
   };
 }
@@ -143,6 +151,7 @@ export const searchBariatricReferralLeads = schedules.task({
     // Practices already logged in a prior run were already confirmed and geocoded — no need
     // to run them through the confirm agent or the geocoders again.
     const knownKeys = await getKnownLeadKeys();
+    const knownProviderNpis = await getKnownProviderNpis();
     const knownGroups = groups.filter((g) => knownKeys.has(g.key));
     const newGroups = groups.filter((g) => !knownKeys.has(g.key));
     console.log(`${knownGroups.length} already known, ${newGroups.length} new candidates`);
@@ -170,20 +179,38 @@ export const searchBariatricReferralLeads = schedules.task({
     inRadius.sort((a, b) => a.distanceMiles - b.distanceMiles);
     console.log(`${inRadius.length} confirmed practices within ${RADIUS_MILES} miles`);
 
+    // Many providers hold privileges at multiple practices, so the same NPI can legitimately
+    // surface at several addresses in this sweep. Keep each provider listed only once — at
+    // their closest new location, or not at all if they're already logged somewhere in the
+    // sheet — instead of repeating their name on every practice's row.
+    type DedupedGroup = { group: CandidateGroupPayload; distanceMiles: number };
+    const usedNpis = new Set(knownProviderNpis);
+    const deduped: DedupedGroup[] = [];
+    for (const { group, distanceMiles } of inRadius) {
+      const remainingProviders = group.providers.filter((p) => !usedNpis.has(p.npi));
+      if (remainingProviders.length === 0) continue; // every provider here is already logged elsewhere
+      for (const p of remainingProviders) usedNpis.add(p.npi);
+      deduped.push({ group: { ...group, providers: remainingProviders }, distanceMiles });
+    }
+    console.log(`${deduped.length} practices remain after cross-location provider dedup`);
+
     // Cap here (not just in syncLeadsToSheet) so website lookups only run for leads that
     // will actually be written — keeps us well under the search API's free-tier quota.
-    const toAdd = inRadius.slice(0, MAX_NEW_LEADS_PER_RUN);
+    const toAdd = deduped.slice(0, MAX_NEW_LEADS_PER_RUN);
 
     const leads: LeadRow[] = [];
     for (const { group, distanceMiles } of toAdd) {
-      const website = await findWebsite(`${[...group.names][0]} ${group.city} MA`);
+      const providerNames = group.providers.map((p) => p.name);
+      const searchName = group.practiceName || providerNames[0];
+      const website = await findWebsite(`${searchName} ${group.city} MA`);
       leads.push({
-        name: group.names.join(" / "),
-        specialty: group.specialties.join(", "),
+        name: providerNames.join(" / "),
+        practiceName: group.practiceName,
+        specialty: [...new Set(group.providers.map((p) => p.specialtyLabel))].join(", "),
         address: group.fullAddress,
         phone: group.phone,
         distanceMiles,
-        npis: group.npis,
+        npis: group.providers.map((p) => p.npi),
         website,
       });
     }
@@ -191,12 +218,13 @@ export const searchBariatricReferralLeads = schedules.task({
     // Already-known groups just need their "Last Seen" date touched — distance, legitimacy,
     // and website were already established when they were first added.
     const refreshLeads: LeadRow[] = knownGroups.map((group) => ({
-      name: [...group.names].join(" / "),
-      specialty: [...group.specialties].join(", "),
+      name: [...group.providers.values()].map((p) => p.name).join(" / "),
+      practiceName: group.practiceName,
+      specialty: [...new Set([...group.providers.values()].map((p) => p.specialtyLabel))].join(", "),
       address: group.fullAddress,
       phone: group.phone,
       distanceMiles: 0,
-      npis: [...group.npis],
+      npis: [...group.providers.keys()],
       website: "",
     }));
 
